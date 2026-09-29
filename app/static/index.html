@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>星载启动参数槽恢复审计</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --ok:#0a7d2c; --warn:#9a6a00; --bad:#b00020; --muted:#667; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; margin:0; background:#f4f6f8; color:#1c2330; }
+  header { background:#10243e; color:#fff; padding:18px 28px; }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:6px 0 0; font-size:13px; color:#b9c7d8; }
+  main { max-width:1080px; margin:24px auto; padding:0 16px 48px; }
+  .card { background:#fff; border:1px solid #dde3ea; border-radius:8px; padding:18px 20px; margin-bottom:18px; }
+  .card h2 { margin:0 0 12px; font-size:16px; }
+  label { display:block; font-size:13px; color:#445; margin:10px 0 4px; }
+  input[type=text], select, textarea { width:100%; padding:8px 10px; border:1px solid #c4cdd8; border-radius:6px; font-size:13px; font-family:inherit; }
+  textarea { font-family: ui-monospace, Consolas, monospace; min-height:150px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1; min-width:170px; }
+  button { background:#10243e; color:#fff; border:0; border-radius:6px; padding:9px 16px; font-size:13px; cursor:pointer; margin-top:12px; }
+  button.ghost { background:#e8edf3; color:#10243e; }
+  button:hover { opacity:.9; }
+  .error { color:var(--bad); font-size:13px; margin-top:10px; white-space:pre-wrap; }
+  .note { color:var(--muted); font-size:13px; margin-top:10px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+  .kv { background:#f6f8fa; border-radius:6px; padding:10px 12px; }
+  .kv .k { font-size:12px; color:var(--muted); }
+  .kv .v { font-size:15px; font-weight:600; margin-top:2px; word-break:break-all; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid #e6ebf0; vertical-align:top; }
+  th { color:#556; font-weight:600; background:#f6f8fa; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; font-weight:600; }
+  .b-adopted { background:#e2f4e5; color:var(--ok); }
+  .b-discarded { background:#f7efd8; color:var(--warn); }
+  .b-violation { background:#fbe3e6; color:var(--bad); }
+  .b-unevaluated { background:#eceff2; color:var(--muted); }
+  .violation-box { border-left:4px solid var(--bad); background:#fdf2f3; padding:10px 14px; border-radius:6px; font-size:13px; }
+  .ok-box { border-left:4px solid var(--ok); background:#f0f9f1; padding:10px 14px; border-radius:6px; font-size:13px; }
+  .hidden { display:none; }
+  .basis { color:#445; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>星载启动参数槽恢复审计</h1>
+  <p>按物理写入顺序重放扇区镜像，逐字节校验固定字段与 CRC32，裁定重启实际采用的完整参数代次；写到一半的较新槽不会被误报为可启动。</p>
+</header>
+<main>
+  <div class="card">
+    <h2>提交审计（结论将被冻结）</h2>
+    <div class="row">
+      <div>
+        <label for="auditId">审计标识（稳定，可据此复查）</label>
+        <input type="text" id="auditId" placeholder="例如 audit-2026-001">
+      </div>
+      <div>
+        <label for="initialSlot">初始活动槽</label>
+        <select id="initialSlot"><option value="A">A</option><option value="B">B</option></select>
+      </div>
+      <div>
+        <label for="scenario">示例场景</label>
+        <select id="scenario">
+          <option value="complete">完整切换</option>
+          <option value="corrupt-complete">完成标记损坏</option>
+          <option value="retain-old">旧有效槽保留</option>
+        </select>
+      </div>
+    </div>
+    <label for="sectors">扇区镜像（每行一个 Base64 定长扇区，按物理写入顺序，至多 32 个）</label>
+    <textarea id="sectors" spellcheck="false"></textarea>
+    <div class="row">
+      <div><button id="submitBtn">提交并冻结结论</button></div>
+      <div><button class="ghost" id="loadExample">载入示例到表单</button></div>
+      <div><button class="ghost" id="clearBtn">清空扇区</button></div>
+    </div>
+    <div class="error" id="submitError"></div>
+  </div>
+
+  <div class="card">
+    <h2>按标识查看已冻结结论</h2>
+    <div class="row">
+      <div><input type="text" id="lookupId" placeholder="审计标识"></div>
+      <div><button id="lookupBtn">查询</button></div>
+    </div>
+    <div class="error" id="lookupError"></div>
+  </div>
+
+  <div id="result" class="hidden">
+    <div class="card">
+      <h2>恢复结论</h2>
+      <p class="note mono" id="conclMeta"></p>
+      <div class="grid">
+        <div class="kv"><div class="k">重启采用槽</div><div class="v" id="cSlot"></div></div>
+        <div class="kv"><div class="k">代次</div><div class="v" id="cGen"></div></div>
+        <div class="kv"><div class="k">来源</div><div class="v" id="cSource"></div></div>
+        <div class="kv"><div class="k">事务标识</div><div class="v mono" id="cTxid"></div></div>
+        <div class="kv"><div class="k">载荷摘要 (CRC32)</div><div class="v mono" id="cDigest"></div></div>
+        <div class="kv"><div class="k">载荷内容 (hex)</div><div class="v mono" id="cPayload" style="font-size:12px"></div></div>
+      </div>
+      <p class="basis" id="cBasis"></p>
+    </div>
+    <div class="card" id="violationCard">
+      <h2>首个违约</h2>
+      <div id="violationBody"></div>
+    </div>
+    <div class="card">
+      <h2>逐条记录判定与依据</h2>
+      <table>
+        <thead><tr><th>#</th><th>类型</th><th>槽</th><th>事务</th><th>代次</th><th>摘要</th><th>判定</th><th>依据</th></tr></thead>
+        <tbody id="recordsBody"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const TYPE_ZH = { slot_page: "槽页", prepare: "准备记录", complete: "完成记录", unknown: "无法解析" };
+const DEC_ZH = { adopted: "采纳", discarded: "舍弃", violation: "违约", unevaluated: "未评估" };
+const KIND_ZH = {
+  truncation: "截断", checksum: "校验和错误", structural: "结构错误", encoding: "编码错误",
+  duplicate_txid: "事务标识内容不一致", unfinished_page: "完成记录指向未完成页",
+  order: "写入顺序错误", digest_mismatch: "载荷摘要不符"
+};
+
+async function api(method, url, body) {
+  const resp = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await resp.json().catch(() => ({}));
+  return { status: resp.status, data };
+}
+
+$("loadExample").onclick = async () => {
+  const sc = $("scenario").value;
+  const { status, data } = await api("GET", "/api/example?scenario=" + sc);
+  if (status !== 200) { $("submitError").textContent = data.error || "载入示例失败"; return; }
+  $("initialSlot").value = data.initial_slot;
+  $("sectors").value = data.sectors.join("\n");
+  $("submitError").textContent = "已载入示例：" + data.note;
+};
+
+$("clearBtn").onclick = () => { $("sectors").value = ""; $("submitError").textContent = ""; };
+
+$("submitBtn").onclick = async () => {
+  $("submitError").textContent = "";
+  const auditId = $("auditId").value.trim();
+  const sectors = $("sectors").value.split("\n").map(s => s.trim()).filter(Boolean);
+  const { status, data } = await api("POST", "/api/audits", {
+    audit_id: auditId, initial_slot: $("initialSlot").value, sectors
+  });
+  if (status === 201) { render(data); return; }
+  if (status === 409) {
+    $("submitError").textContent = data.error;
+    const existing = await api("GET", "/api/audits/" + encodeURIComponent(auditId));
+    if (existing.status === 200) render(existing.data);
+    return;
+  }
+  $("submitError").textContent = data.error || ("提交失败：" + status);
+};
+
+$("lookupBtn").onclick = async () => {
+  $("lookupError").textContent = "";
+  const id = $("lookupId").value.trim();
+  const { status, data } = await api("GET", "/api/audits/" + encodeURIComponent(id));
+  if (status === 200) render(data);
+  else $("lookupError").textContent = data.error || ("查询失败：" + status);
+};
+
+function render(doc) {
+  $("result").classList.remove("hidden");
+  const c = doc.conclusion;
+  $("conclMeta").textContent =
+    `审计标识 ${doc.audit_id} ｜ 初始槽 ${doc.initial_slot} ｜ 扇区 ${doc.sector_count} 个 ｜ 冻结于 ${doc.created_at}`;
+  $("cSlot").textContent = c.slot;
+  $("cGen").textContent = c.generation === null ? "—" : c.generation;
+  $("cSource").textContent = c.source === "committed" ? "已提交事务" : "初始活动槽";
+  $("cTxid").textContent = c.txid === null ? "—" : c.txid;
+  $("cDigest").textContent = c.payload_digest || "—";
+  $("cPayload").textContent = c.payload_hex || "—";
+  $("cBasis").textContent = c.basis;
+
+  $("violationBody").innerHTML = "";
+  const box = document.createElement("div");
+  const v = doc.first_violation;
+  if (v) {
+    box.className = "violation-box";
+    box.textContent = `扇区 #${v.index} ｜ ${KIND_ZH[v.kind] || v.kind} ｜ ${v.detail}`;
+  } else {
+    box.className = "ok-box";
+    box.textContent = "未发现违约，全部记录完整。";
+  }
+  $("violationBody").appendChild(box);
+
+  const tbody = $("recordsBody");
+  tbody.innerHTML = "";
+  for (const r of doc.records) {
+    const tr = document.createElement("tr");
+    const cells = [
+      r.index,
+      TYPE_ZH[r.type] || "—",
+      r.slot || "—",
+      r.txid === null ? "—" : r.txid,
+      r.generation === null ? "—" : r.generation,
+      r.digest || "—"
+    ];
+    for (const val of cells) {
+      const td = document.createElement("td");
+      td.textContent = val;
+      tr.appendChild(td);
+    }
+    const tdD = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "badge b-" + r.decision;
+    badge.textContent = DEC_ZH[r.decision] || r.decision;
+    tdD.appendChild(badge);
+    tr.appendChild(tdD);
+    const tdB = document.createElement("td");
+    tdB.textContent = r.basis;
+    tr.appendChild(tdB);
+    tbody.appendChild(tr);
+  }
+  $("result").scrollIntoView({ behavior: "smooth" });
+}
+</script>
+</body>
+</html>
